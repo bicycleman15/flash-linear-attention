@@ -5,8 +5,7 @@
 from __future__ import annotations
 
 import math
-import warnings
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -31,31 +30,32 @@ try:
 except ImportError:
     from fla.models.modeling_layers import GradientCheckpointingLayer
 
-# flex_attention for custom CAT attention mask
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-    FLEX_ATTENTION_AVAILABLE = True
-except ImportError:
-    FLEX_ATTENTION_AVAILABLE = False
-    warnings.warn(
-        "flex_attention is not available (requires PyTorch 2.5+). "
-        "CAT model will use a fallback attention implementation.",
-        category=ImportWarning,
-    )
+
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention, BlockMask
+
+create_block_mask = torch.compile(create_block_mask)
+
+_flex_attention_compiled = torch.compile(flex_attention, dynamic=False, mode="default")
+
+
+@torch.compiler.disable(recursive=False)
+def flex_attention_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_mask: Optional[BlockMask] = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    return _flex_attention_compiled(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
 
 logger = logging.get_logger(__name__)
 
 
 def get_cat_mask_mod(block_size: int):
     """
-    Create the CAT attention mask modifier function.
-    
-    The CAT mask allows:
-    - Tokens within the same chunk block to attend to each other (causal)
-    - Tokens to attend to the first position of each previous chunk (compressed representations)
-    
-    Args:
-        block_size: Size of each chunk block (2 + chunk_size for separator + fx + tokens)
+    Creates the CAT attention mask. This mask allows:
+    - tokens within the same chunk to attend to each other (causal)
+    - tokens to attend previous compressed representations
     """
     def cat_mask(b, h, q_idx, kv_idx):
         within_block = (q_idx // block_size) == (kv_idx // block_size)
@@ -63,6 +63,13 @@ def get_cat_mask_mod(block_size: int):
         causal_mask = q_idx >= kv_idx
         return (divides_block | within_block) & causal_mask
     return cat_mask
+
+
+def get_block_diagonal_mask_mod(block_size: int):
+    # used in compressor
+    def block_diagonal(b, h, q_idx, kv_idx):
+        return (q_idx // block_size) == (kv_idx // block_size)
+    return block_diagonal
 
 
 class CATCompressorBlock(GradientCheckpointingLayer):
@@ -100,6 +107,7 @@ class CATCompressorBlock(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        block_mask: BlockMask,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
@@ -114,12 +122,12 @@ class CATCompressorBlock(GradientCheckpointingLayer):
         q = self._apply_rotary(q, cos, sin)
         k = self._apply_rotary(k, cos, sin)
         
-        # Scaled dot-product attention (bidirectional for compressor)
         q = rearrange(q, 'b t h d -> b h t d')
         k = rearrange(k, 'b t h d -> b h t d')
         v = rearrange(v, 'b t h d -> b h t d')
         
-        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        # Use flex_attention with block mask
+        attn_output = flex_attention_compiled(q, k, v, block_mask=block_mask)
         attn_output = rearrange(attn_output, 'b h t d -> b t (h d)')
         hidden_states = self.o_proj(attn_output)
         
@@ -138,17 +146,17 @@ class CATCompressorBlock(GradientCheckpointingLayer):
     def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Apply rotary position embeddings."""
         # x: [batch, seq, heads, dim]
-        # cos, sin: [1, seq, dim//2]
+        # cos, sin: 2D [seq, dim//2] from cache or 3D [1, seq, dim//2]
         seq_len = x.shape[1]
-        cos = cos[:, :seq_len, :]
-        sin = sin[:, :seq_len, :]
+        if cos.dim() == 2:
+            cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(2)  # [1, seq, 1, dim//2]
+            sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(2)
+        else:
+            cos = cos[:, :seq_len, :].unsqueeze(2)  # [1, seq, 1, dim//2]
+            sin = sin[:, :seq_len, :].unsqueeze(2)
         
         # Split x into two halves
         x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-        
-        # Apply rotation
-        cos = cos.unsqueeze(2)  # [1, seq, 1, dim//2]
-        sin = sin.unsqueeze(2)  # [1, seq, 1, dim//2]
         
         rotated = torch.cat([
             x1 * cos - x2 * sin,
@@ -266,10 +274,95 @@ class CATCompressor(nn.Module):
         
         return x  # [batch, dim_fx]
 
+    def compress_batched(
+        self,
+        input_ids_chunked: torch.LongTensor,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        """
+        Compress all chunks in one forward pass using a block-diagonal attention mask
+        so the encoder attends only to tokens within each chunk.
+
+        Args:
+            input_ids_chunked: [batch_size, num_chunks, chunk_size]
+            chunk_size: Current chunk size
+
+        Returns:
+            Compressed representations [batch_size, num_chunks, dim_fx]
+        """
+        batch_size, num_chunks, _chunk_size = input_ids_chunked.shape
+        # sanity check
+        assert chunk_size == _chunk_size, f"chunk_size ({chunk_size}) != input chunk size ({_chunk_size})"
+
+        device = input_ids_chunked.device
+        dtype = self.wte.weight.dtype
+        block_len = 2 + chunk_size
+
+        # Embed tokens: [batch, num_chunks, chunk_size, hidden]
+        token_embeds = self.wte(input_ids_chunked)
+
+        # Adaptive token (same for all chunks - encodes chunk_size)
+        chunk_size_idx = torch.tensor([chunk_size], device=device, dtype=torch.long)
+        adaptive_token = self.adaptive_tokens(chunk_size_idx)  # [1, hidden]
+        adaptive_token = repeat(adaptive_token, '1 d -> b k 1 d', b=batch_size, k=num_chunks)
+
+        # Position token per chunk (chunk 0 -> pos 0, chunk 1 -> pos 1, ...)
+        chunk_indices = torch.arange(num_chunks, device=device, dtype=torch.long)
+        pos_tokens = self.pos_tokens(chunk_indices)  # [num_chunks, hidden]
+        pos_tokens = repeat(pos_tokens, 'k d -> b k 1 d', b=batch_size)  # [batch, num_chunks, 1, hidden]
+
+        # Concatenate [adaptive, position, tokens] per chunk -> [batch, num_chunks, 2+chunk_size, hidden]
+        x = torch.cat([adaptive_token, pos_tokens, token_embeds], dim=2)
+        total_len = num_chunks * block_len
+        x = rearrange(x, 'b k l d -> b (k l) d')  # [batch, total_len, hidden]
+
+        # Block-diagonal mask: attend only within each chunk block
+        compressor_block_mask = create_block_mask(
+            get_block_diagonal_mask_mod(block_len),
+            B=None,
+            H=None,
+            Q_LEN=total_len,
+            KV_LEN=total_len,
+        )
+
+        # RoPE: positions repeat per block (position i has index i % block_len)
+        self.rotary._update_cos_sin_cache(block_len, device=device, dtype=dtype)
+        cos_base = self.rotary._cos_cached  # [block_len, dim//2]
+        sin_base = self.rotary._sin_cached
+        position_ids = torch.arange(total_len, device=device) % block_len
+        cos = cos_base[position_ids].unsqueeze(0)   # [1, total_len, dim//2]
+        sin = sin_base[position_ids].unsqueeze(0)
+
+        # Transformer layers with block-diagonal attention mask
+        for layer in self.layers:
+            x = layer(x, cos, sin, block_mask=compressor_block_mask)
+        x = self.norm(x)
+
+        # Reshape back: [batch, total_len, hidden] -> [batch, num_chunks, block_len, hidden]
+        x = rearrange(x, 'b (k l) d -> b k l d', k=num_chunks, l=block_len)
+        # Drop adaptive + position; keep tokens only
+        x = x[:, :, 2:, :]  # [batch, num_chunks, chunk_size, hidden]
+        x = rearrange(x, 'b k l d -> b k (l d)')  # [batch, num_chunks, chunk_size * hidden]
+
+        # Project to dim_fx (same logic as single-chunk: interpolate if chunk_size != max_chunk_size)
+        if chunk_size != self.max_chunk_size:
+            target_in_features = chunk_size * self.hidden_size
+            new_weight = F.interpolate(
+                self.proj_fx.weight.unsqueeze(0).unsqueeze(0),
+                size=(self.config.dim_fx, target_in_features),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+            x = F.linear(x, new_weight, bias=None)  # [batch, num_chunks, dim_fx]
+        else:
+            x = self.proj_fx(x)  # [batch, num_chunks, dim_fx]
+
+        return x
+
 
 class CATDecoderAttention(nn.Module):
     """
-    Attention module for CAT decoder with custom attention mask.
+    This is same as default Attention, just with added support for FlexAttention and custom BlockMask.
     """
 
     def __init__(self, config: CATConfig, layer_idx: int):
@@ -300,8 +393,7 @@ class CATDecoderAttention(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        block_mask: Any | None = None,
+        block_mask: BlockMask,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         
@@ -327,15 +419,8 @@ class CATDecoderAttention(nn.Module):
         k = rearrange(k, 'b t h d -> b h t d')
         v = rearrange(v, 'b t h d -> b h t d')
         
-        # Use flex_attention if available and block_mask provided
-        if FLEX_ATTENTION_AVAILABLE and block_mask is not None:
-            attn_output = flex_attention(q, k, v, block_mask=block_mask)
-        else:
-            # Fallback to standard attention with explicit mask
-            if attention_mask is not None:
-                attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
-            else:
-                attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Use flex_attention with CAT block mask
+        attn_output = flex_attention_compiled(q, k, v, block_mask=block_mask)
         
         attn_output = rearrange(attn_output, 'b h t d -> b t (h d)')
         output = self.o_proj(attn_output)
@@ -386,8 +471,7 @@ class CATBlock(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        block_mask: Any | None = None,
+        block_mask: BlockMask,
         **kwargs: Unpack[Any],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -396,7 +480,6 @@ class CATBlock(GradientCheckpointingLayer):
             hidden_states,
             cos=cos,
             sin=sin,
-            attention_mask=attention_mask,
             block_mask=block_mask,
         )
         
@@ -455,9 +538,6 @@ class CATPreTrainedModel(PreTrainedModel):
 class CATModel(CATPreTrainedModel):
     """
     CAT (Compress And Attend Transformer) model.
-    
-    This model compresses chunks of tokens and attends over both compressed
-    representations and tokens within chunks.
     """
 
     def __init__(self, config: CATConfig):
@@ -475,8 +555,9 @@ class CATModel(CATPreTrainedModel):
         # Separator token (separates fx from tokens in each chunk)
         self.separator = nn.Embedding(1, config.hidden_size)
         
-        # Dummy fx token (conditioning vector for first chunk)
-        self.dummy_fx = nn.Embedding(config.max_chunk_size + 1, config.hidden_size)
+        # Adaptive token -- informs the decoder about the current chunk size it is operating at
+        # changing this allows the decoder to operate at multiple chunk sizes
+        self.adaptive_token = nn.Embedding(config.max_chunk_size + 1, config.hidden_size)
         
         # Decoder layers
         self.layers = nn.ModuleList([
@@ -545,37 +626,6 @@ class CATModel(CATPreTrainedModel):
         
         return cos.unsqueeze(0), sin.unsqueeze(0)  # [1, total_len, dim//2]
 
-    def _build_attention_mask(
-        self,
-        batch_size: int,
-        seq_len: int,
-        chunk_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Build the CAT attention mask for decoder."""
-        block_size = 2 + chunk_size  # fx + separator + tokens
-        
-        # Create mask where 0 = attend, -inf = don't attend
-        mask = torch.full((seq_len, seq_len), float('-inf'), device=device, dtype=dtype)
-        
-        for i in range(seq_len):
-            for j in range(seq_len):
-                if j > i:  # Causal: can't attend to future
-                    continue
-                
-                i_block = i // block_size
-                j_block = j // block_size
-                
-                # Within same block: can attend (causal)
-                if i_block == j_block:
-                    mask[i, j] = 0
-                # First position of each previous block (compressed repr)
-                elif j % block_size == 0:
-                    mask[i, j] = 0
-        
-        return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -590,7 +640,7 @@ class CATModel(CATPreTrainedModel):
         **kwargs: Unpack[Any],
     ) -> tuple | BaseModelOutputWithPast:
         if output_attentions:
-            warnings.warn("`CATModel` does not support output_attentions, setting to False.")
+            logger.warning_once("`CATModel` does not support output_attentions, setting to False.")
             output_attentions = False
         
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -619,10 +669,16 @@ class CATModel(CATPreTrainedModel):
             batch_size, seq_len, _ = inputs_embeds.shape
             device = inputs_embeds.device
         
-        # Pad sequence to be multiple of chunk_size
+        # Pad sequence to a multiple of 512 (and chunk_size) to prevent flex_attention recompilation
+        # The padding multiple must be divisible by chunk_size
         original_seq_len = seq_len
-        if seq_len % chunk_size != 0:
-            pad_len = chunk_size - (seq_len % chunk_size)
+        pad_multiple = max(512, chunk_size)
+        # Ensure pad_multiple is a multiple of chunk_size
+        if pad_multiple % chunk_size != 0:
+            pad_multiple = ((pad_multiple // chunk_size) + 1) * chunk_size
+        
+        if seq_len % pad_multiple != 0:
+            pad_len = pad_multiple - (seq_len % pad_multiple)
             if input_ids is not None:
                 pad_token = self.padding_idx if self.padding_idx is not None else 0
                 input_ids = F.pad(input_ids, (0, pad_len), value=pad_token)
@@ -636,18 +692,11 @@ class CATModel(CATPreTrainedModel):
             # Reshape for chunk processing
             input_ids_chunked = input_ids.view(batch_size, num_chunks, chunk_size)
             
-            # Compress all chunks in parallel using vmap
-            # Process each chunk through compressor
-            fx_list = []
-            for chunk_idx in range(num_chunks):
-                chunk_input = input_ids_chunked[:, chunk_idx, :]  # [batch, chunk_size]
-                chunk_idx_tensor = torch.tensor(chunk_idx, device=device)
-                fx = self.compressor.compress(chunk_input, chunk_idx_tensor, chunk_size)
-                fx_list.append(fx)
+            # Compress all chunks in one forward pass with block-diagonal attention mask
+            # (compressor attends only to tokens within each chunk)
+            fx = self.compressor.compress_batched(input_ids_chunked, chunk_size)  # [batch, num_chunks, dim_fx]
             
-            fx = torch.stack(fx_list, dim=1)  # [batch, num_chunks, dim_fx]
-            
-            # Get last chunk's fx for final prediction
+            # Get last chunk's fx for the last token's prediction in the input sequence
             fx_last = fx[:, -1:, :]  # [batch, 1, dim_fx]
             
             # Embed tokens
@@ -655,13 +704,13 @@ class CATModel(CATPreTrainedModel):
         else:
             raise NotImplementedError("inputs_embeds not yet supported for CAT")
         
-        # Build decoder input sequence
-        # Structure: [dummy_fx, sep, tokens_0, fx_0, sep, tokens_1, ..., fx_{n-1}, sep]
+        # Build decoder input sequence for parallel processing
+        # Structure: [adaptive_token, sep, tokens_0, fx_0, sep, tokens_1, ..., fx_{n-1}, sep]
         
-        # Dummy fx (conditioning for first chunk, encodes chunk_size)
+        # Adaptive token
         chunk_size_idx = torch.tensor([chunk_size], device=device, dtype=torch.long)
-        dummy_fx_token = self.dummy_fx(chunk_size_idx)  # [1, hidden]
-        dummy_fx_token = repeat(dummy_fx_token, '1 d -> b 1 d', b=batch_size)
+        adaptive_tok = self.adaptive_token(chunk_size_idx)  # [1, hidden]
+        adaptive_tok = repeat(adaptive_tok, '1 d -> b 1 d', b=batch_size)
         
         # Separator tokens
         sep_idx = torch.zeros(1, device=device, dtype=torch.long)
@@ -669,15 +718,16 @@ class CATModel(CATPreTrainedModel):
         sep_token = repeat(sep_token, '1 d -> b k 1 d', b=batch_size, k=num_chunks)
         
         # Combine: [fx, sep, tokens] for each chunk
-        # For first chunk, use dummy_fx; for others, use fx from previous chunk
-        fx_shifted = torch.cat([dummy_fx_token.unsqueeze(1), fx[:, :-1, :].unsqueeze(2).squeeze(2).unsqueeze(2)], dim=1)
-        fx_shifted = fx_shifted.unsqueeze(2)  # [batch, num_chunks, 1, hidden]
+        # For first chunk, use adaptive_token; for others, use fx from previous chunk
+        # adaptive_tok: [b, 1, d] -> unsqueeze(1) -> [b, 1, 1, d]
+        # fx[:, :-1, :]: [b, k-1, d] -> unsqueeze(2) -> [b, k-1, 1, d]
+        fx_shifted = torch.cat([adaptive_tok.unsqueeze(1), fx[:, :-1, :].unsqueeze(2)], dim=1)  # [batch, num_chunks, 1, hidden]
         
         # Build sequence: [fx, sep, tokens] per chunk
         decoder_input = torch.cat([fx_shifted, sep_token, token_embeds], dim=2)  # [batch, num_chunks, 2+chunk_size, hidden]
         decoder_input = rearrange(decoder_input, 'b k l d -> b (k l) d')  # [batch, num_chunks*(2+chunk_size), hidden]
         
-        # Add final fx and separator for last prediction
+        # Add final fx and separator for last token's prediction
         last_sep = repeat(self.separator(sep_idx), '1 d -> b 1 d', b=batch_size)
         decoder_input = torch.cat([decoder_input, fx_last, last_sep], dim=1)
         
@@ -687,21 +737,14 @@ class CATModel(CATPreTrainedModel):
         # Build RoPE cache for CAT positions
         cos, sin = self._build_cat_rope_cache(num_chunks, chunk_size, device, hidden_states.dtype)
         
-        # Build attention mask
-        if FLEX_ATTENTION_AVAILABLE:
-            block_size = 2 + chunk_size
-            block_mask = create_block_mask(
-                get_cat_mask_mod(block_size),
-                B=None, H=None,
-                Q_LEN=total_seq_len,
-                KV_LEN=total_seq_len,
-            )
-            cat_attention_mask = None
-        else:
-            block_mask = None
-            cat_attention_mask = self._build_attention_mask(
-                batch_size, total_seq_len, chunk_size, device, hidden_states.dtype
-            )
+        # Build CAT attention mask using flex_attention
+        block_size = 2 + chunk_size
+        block_mask = create_block_mask(
+            get_cat_mask_mod(block_size),
+            B=None, H=None,
+            Q_LEN=total_seq_len,
+            KV_LEN=total_seq_len,
+        )
         
         all_hidden_states = () if output_hidden_states else None
         
@@ -713,7 +756,6 @@ class CATModel(CATPreTrainedModel):
                 hidden_states,
                 cos=cos,
                 sin=sin,
-                attention_mask=cat_attention_mask,
                 block_mask=block_mask,
                 **kwargs,
             )
