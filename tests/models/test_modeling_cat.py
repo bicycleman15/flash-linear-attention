@@ -141,6 +141,39 @@ def test_cat_compiled_forward():
 
 
 @pytest.mark.parametrize(
+    ['chunk_size'],
+    [
+        pytest.param(chunk_size, id=f"chunk{chunk_size}")
+        for chunk_size in [4, 8, 16]  # Test multiple chunk sizes up to max_chunk_size=16
+    ],
+)
+def test_cat_generation(chunk_size: int):
+    """Test CAT model generation via repeated forward passes."""
+    model, config = create_cat_model(2, 4, 64, max_chunk_size=16, dtype=torch.bfloat16)
+    model.eval()
+
+    # Prompt of 32 tokens, generate 16 more
+    prompt_len = 32
+    max_new_tokens = 16
+    input_ids = torch.randint(low=0, high=config.vocab_size, size=(1, prompt_len), device=device)
+
+    with torch.no_grad():
+        # Generate using HF's generate (will do repeated forward passes since CAT has no KV cache)
+        output_ids = model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=False,  # CAT doesn't use standard KV cache
+            chunk_size=chunk_size,
+        )
+
+    assert output_ids.shape[0] == 1
+    assert output_ids.shape[1] == prompt_len + max_new_tokens
+    # Verify prompt is preserved
+    assert torch.equal(output_ids[:, :prompt_len], input_ids)
+
+
+@pytest.mark.parametrize(
     ['L', 'B', 'T', 'H', 'D', 'max_chunk_size', 'dtype'],
     [
         pytest.param(*test, id="L{}-B{}-T{}-H{}-D{}-chunk{}-{}".format(*test))

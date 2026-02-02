@@ -9,7 +9,7 @@ from fla.utils import device
 
 # Models that do not yet support variable sequence lengths (for modeling tests)
 MODELING_UNSUPPORTED_VARLEN = [
-    "ABCConfig", "ForgettingTransformerConfig", "LinearAttentionConfig", "LightNetConfig",
+    "ABCConfig", "CATConfig", "ForgettingTransformerConfig", "LinearAttentionConfig", "LightNetConfig",
     "Mamba2Config", "MambaConfig", "MesaNetConfig", "SambaConfig",
     "RodimusConfig",
 ]
@@ -21,7 +21,7 @@ NOT_READY_FOR_TESTING = ['RodimusConfig']
 HOPPER_EXCLUSIVE = []
 
 GENERATION_UNSUPPORTED = [
-    "ABCConfig", "LinearAttentionConfig", "LightNetConfig",
+    "ABCConfig", "CATConfig", "LinearAttentionConfig", "LightNetConfig",
     "Mamba2Config", "MambaConfig", "NSAConfig", "SambaConfig", "RWKV6Config", "RWKV7Config",
     "DeltaFormerConfig",
 ]
