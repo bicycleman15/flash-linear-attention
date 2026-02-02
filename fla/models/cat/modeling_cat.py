@@ -54,9 +54,23 @@ logger = logging.get_logger(__name__)
 
 def get_cat_mask_mod(block_size: int):
     """
-    Creates the CAT attention mask. This mask allows:
-    - tokens within the same chunk to attend to each other (causal)
-    - tokens to attend previous compressed representations
+    Creates the CAT (interleaved) attention mask.
+    This is mask doesn't result in speedups due to FlexAttention not taking advantage of within-block sparsity.
+    FlexAttention takes advantage of block-sparsity, so staircase is recommended for pre-training.
+    We provide both implementations for completeness.
+    
+    Sequence structure: [fx_0, sep_0, tok_0_0, ..., tok_0_{l-1}, fx_1, sep_1, tok_1_0, ..., tok_1_{l-1}, ..., fx_K, sep_K]
+    - Each block has structure: [fx, sep, tok_0, ..., tok_{l-1}] where l = block_size - 2
+    - Total K blocks of size block_size, plus final [fx, sep] for last token prediction
+    
+    Attention pattern:
+    - Within block: causal attention among tokens in the same block
+    - Cross block: tokens can attend to all previous fx positions (kv_idx % block_size == 0)
+    
+    Args:
+        block_size: Size of each block (fx + sep + chunk_size = 2 + chunk_size)
+    
+    Reference figure: https://ibb.co/67r0dzvY (sequence_length=8, block_size=4)
     """
     def cat_mask(b, h, q_idx, kv_idx):
         within_block = (q_idx // block_size) == (kv_idx // block_size)
@@ -67,7 +81,10 @@ def get_cat_mask_mod(block_size: int):
 
 
 def get_block_diagonal_mask_mod(block_size: int):
-    # used in compressor
+    """
+    Creates the block-diagonal attention mask.
+    Used in compressor to attend only to tokens within each chunk.
+    """
     def block_diagonal(b, h, q_idx, kv_idx):
         return (q_idx // block_size) == (kv_idx // block_size)
     return block_diagonal
@@ -76,18 +93,21 @@ def get_block_diagonal_mask_mod(block_size: int):
 def get_staircase_mask_mod(chunk_size: int, num_globals: int):
     """
     Staircase attention mask.
+    This mask is better suited for FlexAttention to provide speedups in pre-training.
     
-    Sequence structure: [fx_0, ..., fx_K, sep_0, tok_0_0, ..., tok_0_{l-1}, ..., sep_K]
+    Sequence structure: [adap_token, fx_0, ..., fx_{K-1}, sep_0, tok_0_0, ..., tok_0_{l-1}, sep_1, tok_1_0, ... tok_1_{l-1}, sep_2, ..., tok_{K-1}_{l-1}, sep_K]
     - First (K+1) positions: global fx slots (adaptive_tok + compressed representations)
     - Remaining K*(1+l)+1 positions: local blocks [sep, tok_0, ..., tok_{l-1}] per chunk + final sep
     
     Attention pattern:
-    - Global-to-global: causal attention among fx tokens (fx_i attends to fx_0..fx_i)
     - Global staircase: query in chunk c can attend to fx slots 0..c
     - Within block: causal attention to tokens in same chunk (including sep)
     
+    Here is a reference figure: https://ibb.co/4R6mdSz0 
+    (sequence_length is 8, chunk_size is 4)
+    
     Args:
-        chunk_size: Size of each chunk (l), not including separator
+        chunk_size: Size of each chunk (l), excluding separator
         num_globals: Number of global slots (K+1 = num_chunks + 1)
     """
     local_block_size = 1 + chunk_size  # sep + chunk_size tokens
@@ -97,8 +117,8 @@ def get_staircase_mask_mod(chunk_size: int, num_globals: int):
         q_is_global = q_idx < num_globals
         kv_is_global = kv_idx < num_globals
         
-        # Global-to-global: causal attention among globals
-        global_to_global = q_is_global & kv_is_global & (q_idx >= kv_idx)
+        # Global-to-global: disabled (global outputs not used for prediction)
+        # global_to_global = q_is_global & kv_is_global & (q_idx >= kv_idx)
         
         # For local queries, compute chunk index
         q_local = q_idx - num_globals
@@ -116,7 +136,7 @@ def get_staircase_mask_mod(chunk_size: int, num_globals: int):
         # Causality for local-to-local: causal w.r.t. local position
         local_causal = q_local >= kv_local
         
-        return global_to_global | global_stair | (within_block & local_causal)
+        return global_stair | (within_block & local_causal)
     return staircase_mask
 
 
