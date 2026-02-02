@@ -556,6 +556,12 @@ class CATModel(CATPreTrainedModel):
                 f"chunk_size ({chunk_size}) cannot exceed max_chunk_size ({self.config.max_chunk_size})"
             )
         
+        if self.config.max_position_embeddings % chunk_size != 0:
+            raise ValueError(
+                f"max_position_embeddings ({self.config.max_position_embeddings}) must be divisible by "
+                f"chunk_size ({chunk_size}) for proper chunking."
+            )
+        
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("Cannot specify both input_ids and inputs_embeds")
         if input_ids is None and inputs_embeds is None:
@@ -568,22 +574,24 @@ class CATModel(CATPreTrainedModel):
             batch_size, seq_len, _ = inputs_embeds.shape
             device = inputs_embeds.device
         
-        # Pad sequence to a multiple of 512 (and chunk_size) to prevent flex_attention recompilation
-        # The padding multiple must be divisible by chunk_size
+        # Pad sequence to max_position_embeddings to prevent flex_attention recompilation
+        # Config validation ensures max_position_embeddings is divisible by max_chunk_size
         original_seq_len = seq_len
-        pad_multiple = max(512, chunk_size)
-        # Ensure pad_multiple is a multiple of chunk_size
-        if pad_multiple % chunk_size != 0:
-            pad_multiple = ((pad_multiple // chunk_size) + 1) * chunk_size
+        max_seq_len = self.config.max_position_embeddings
         
-        if seq_len % pad_multiple != 0:
-            pad_len = pad_multiple - (seq_len % pad_multiple)
+        if seq_len > max_seq_len:
+            raise ValueError(
+                f"Input sequence length ({seq_len}) exceeds max_position_embeddings ({max_seq_len})"
+            )
+        
+        if seq_len < max_seq_len:
+            pad_len = max_seq_len - seq_len
             if input_ids is not None:
                 pad_token = self.padding_idx if self.padding_idx is not None else 0
                 input_ids = F.pad(input_ids, (0, pad_len), value=pad_token)
             else:
                 inputs_embeds = F.pad(inputs_embeds, (0, 0, 0, pad_len), value=0)
-            seq_len = seq_len + pad_len
+            seq_len = max_seq_len
         
         num_chunks = seq_len // chunk_size
         
