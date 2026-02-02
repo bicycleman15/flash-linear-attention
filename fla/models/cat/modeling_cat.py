@@ -21,6 +21,7 @@ from fla.models.utils import Cache, FLAGenerationMixin
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
 from fla.modules import GatedMLP as CATMLP
 from fla.modules import RotaryEmbedding
+from fla.modules.rotary import rotary_embedding
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -118,9 +119,9 @@ class CATCompressorBlock(GradientCheckpointingLayer):
         k = rearrange(self.k_proj(hidden_states), 'b t (h d) -> b t h d', h=self.num_heads)
         v = rearrange(self.v_proj(hidden_states), 'b t (h d) -> b t h d', h=self.num_heads)
         
-        # Apply rotary embeddings
-        q = self._apply_rotary(q, cos, sin)
-        k = self._apply_rotary(k, cos, sin)
+        # Apply fused rotary embeddings (cos/sin are pre-indexed for repeating positions)
+        q = rotary_embedding(q, cos, sin, interleaved=False)
+        k = rotary_embedding(k, cos, sin, interleaved=False)
         
         q = rearrange(q, 'b t h d -> b h t d')
         k = rearrange(k, 'b t h d -> b h t d')
@@ -142,28 +143,6 @@ class CATCompressorBlock(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         
         return hidden_states
-
-    def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Apply rotary position embeddings."""
-        # x: [batch, seq, heads, dim]
-        # cos, sin: 2D [seq, dim//2] from cache or 3D [1, seq, dim//2]
-        seq_len = x.shape[1]
-        if cos.dim() == 2:
-            cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(2)  # [1, seq, 1, dim//2]
-            sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(2)
-        else:
-            cos = cos[:, :seq_len, :].unsqueeze(2)  # [1, seq, 1, dim//2]
-            sin = sin[:, :seq_len, :].unsqueeze(2)
-        
-        # Split x into two halves
-        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-        
-        rotated = torch.cat([
-            x1 * cos - x2 * sin,
-            x1 * sin + x2 * cos
-        ], dim=-1)
-        
-        return rotated
 
 
 class CATCompressor(nn.Module):
@@ -208,72 +187,6 @@ class CATCompressor(nn.Module):
             base=config.rope_theta,
         )
 
-    def compress(
-        self,
-        input_ids: torch.LongTensor,
-        chunk_idx: torch.LongTensor,
-        chunk_size: int,
-    ) -> torch.Tensor:
-        """
-        Compress a single chunk of tokens.
-        
-        Args:
-            input_ids: Token IDs for the chunk [batch_size, chunk_size]
-            chunk_idx: Index of this chunk in the sequence [1]
-            chunk_size: Current chunk size being used
-            
-        Returns:
-            Compressed representation [batch_size, dim_fx]
-        """
-        batch_size, seq_len = input_ids.shape
-        assert seq_len == chunk_size
-        
-        # Embed tokens
-        x = self.wte(input_ids)  # [batch, chunk_size, hidden]
-        
-        # Position token tells compressor which position this chunk is in
-        pos_token = self.pos_tokens(chunk_idx)  # [hidden]
-        pos_token = repeat(pos_token, 'd -> b 1 d', b=batch_size)  # [batch, 1, hidden]
-        
-        # Adaptive token encodes the current chunk size
-        chunk_size_idx = torch.tensor([chunk_size], device=input_ids.device, dtype=torch.long)
-        adaptive_token = self.adaptive_tokens(chunk_size_idx)  # [1, hidden]
-        adaptive_token = repeat(adaptive_token, '1 d -> b 1 d', b=batch_size)  # [batch, 1, hidden]
-        
-        # Concatenate: [adaptive, position, tokens]
-        x = torch.cat([adaptive_token, pos_token, x], dim=1)  # [batch, 2+chunk_size, hidden]
-        
-        # Get RoPE embeddings
-        seq_len_with_special = x.shape[1]
-        self.rotary._update_cos_sin_cache(seq_len_with_special, device=x.device, dtype=x.dtype)
-        cos = self.rotary._cos_cached
-        sin = self.rotary._sin_cached
-        
-        # Apply transformer layers
-        for layer in self.layers:
-            x = layer(x, cos, sin)
-        x = self.norm(x)
-        
-        # Remove special tokens and flatten
-        x = x[:, 2:, :]  # [batch, chunk_size, hidden]
-        x = rearrange(x, 'b l d -> b (l d)')  # [batch, chunk_size * hidden]
-        
-        # Adaptive projection for variable chunk sizes
-        if chunk_size != self.max_chunk_size:
-            # Interpolate projection weights for current chunk size
-            target_in_features = chunk_size * self.hidden_size
-            new_weight = F.interpolate(
-                self.proj_fx.weight.unsqueeze(0).unsqueeze(0),
-                size=(self.config.dim_fx, target_in_features),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0).squeeze(0)
-            x = F.linear(x, new_weight, bias=None)
-        else:
-            x = self.proj_fx(x)
-        
-        return x  # [batch, dim_fx]
-
     def compress_batched(
         self,
         input_ids_chunked: torch.LongTensor,
@@ -291,8 +204,9 @@ class CATCompressor(nn.Module):
             Compressed representations [batch_size, num_chunks, dim_fx]
         """
         batch_size, num_chunks, _chunk_size = input_ids_chunked.shape
-        # sanity check
+        # sanity checks
         assert chunk_size == _chunk_size, f"chunk_size ({chunk_size}) != input chunk size ({_chunk_size})"
+        assert chunk_size <= self.max_chunk_size, f"chunk_size ({chunk_size}) must be <= max_chunk_size ({self.max_chunk_size})"
 
         device = input_ids_chunked.device
         dtype = self.wte.weight.dtype
@@ -326,12 +240,14 @@ class CATCompressor(nn.Module):
         )
 
         # RoPE: positions repeat per block (position i has index i % block_len)
-        self.rotary._update_cos_sin_cache(block_len, device=device, dtype=dtype)
-        cos_base = self.rotary._cos_cached  # [block_len, dim//2]
+        # Cache for max_block_len so we don't recompute on every forward pass
+        max_block_len = 2 + self.max_chunk_size
+        self.rotary._update_cos_sin_cache(max_block_len, device=device, dtype=dtype)
+        cos_base = self.rotary._cos_cached  # [max_block_len, dim//2]
         sin_base = self.rotary._sin_cached
         position_ids = torch.arange(total_len, device=device) % block_len
-        cos = cos_base[position_ids].unsqueeze(0)   # [1, total_len, dim//2]
-        sin = sin_base[position_ids].unsqueeze(0)
+        cos = cos_base[position_ids]  # [total_len, dim//2] - pre-indexed for fused rotary
+        sin = sin_base[position_ids]
 
         # Transformer layers with block-diagonal attention mask
         for layer in self.layers:
@@ -405,9 +321,9 @@ class CATDecoderAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         
-        # Apply rotary embeddings using position indices from cos/sin
-        q = self._apply_rotary(q, cos, sin)
-        k = self._apply_rotary(k, cos, sin)
+        # Apply fused rotary embeddings (cos/sin are pre-indexed for CAT positions)
+        q = rotary_embedding(q, cos, sin, interleaved=False)
+        k = rotary_embedding(k, cos, sin, interleaved=False)
         
         # Expand KV heads for GQA
         if self.num_kv_groups > 1:
@@ -426,24 +342,6 @@ class CATDecoderAttention(nn.Module):
         output = self.o_proj(attn_output)
         
         return output
-
-    def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Apply rotary position embeddings."""
-        seq_len = x.shape[1]
-        cos = cos[:, :seq_len, :]
-        sin = sin[:, :seq_len, :]
-        
-        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-        
-        cos = cos.unsqueeze(2)
-        sin = sin.unsqueeze(2)
-        
-        rotated = torch.cat([
-            x1 * cos - x2 * sin,
-            x1 * sin + x2 * cos
-        ], dim=-1)
-        
-        return rotated
 
 
 class CATBlock(GradientCheckpointingLayer):
@@ -608,9 +506,10 @@ class CATModel(CATPreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build RoPE cos/sin cache for CAT decoder positions."""
         block_len = 2 + chunk_size
-        max_pos = block_len + 2  # Maximum position needed
+        # Cache for max possible position (4 + max_chunk_size) so we don't recompute
+        max_pos = 4 + self.config.max_chunk_size
         
-        # Update rotary cache
+        # Update rotary cache (no-op if already cached for this size)
         self.rotary._update_cos_sin_cache(max_pos, device=device, dtype=dtype)
         
         # Get base cos/sin
@@ -620,11 +519,11 @@ class CATModel(CATPreTrainedModel):
         # Build positions that repeat per chunk
         positions = self._build_cat_positions(num_chunks, chunk_size, device)
         
-        # Index into base cache
+        # Index into base cache - return 2D for fused rotary_embedding
         cos = cos_base[positions]  # [total_len, dim//2]
         sin = sin_base[positions]  # [total_len, dim//2]
         
-        return cos.unsqueeze(0), sin.unsqueeze(0)  # [1, total_len, dim//2]
+        return cos, sin
 
     def forward(
         self,
@@ -737,7 +636,7 @@ class CATModel(CATPreTrainedModel):
         # Build RoPE cache for CAT positions
         cos, sin = self._build_cat_rope_cache(num_chunks, chunk_size, device, hidden_states.dtype)
         
-        # Build CAT attention mask using flex_attention
+        # Build CAT attention mask
         block_size = 2 + chunk_size
         block_mask = create_block_mask(
             get_cat_mask_mod(block_size),
