@@ -70,8 +70,9 @@ class CATConfig(PretrainedConfig):
             Whether to use fused linear cross entropy (memory efficient).
         vocab_size (`int`, *optional*, defaults to 32000):
             Vocabulary size.
-        use_staircase_attention (`bool`, *optional*, defaults to False):
+        use_staircase_attention (`bool`, *optional*, defaults to True):
             Whether to use staircase attention pattern with globals-first sequence structure.
+            This is better suited for taking advantage of FlexAttention to provide speedups in pre-training.
             When True, sequence is [fx_0, ..., fx_K, tok_0, ..., tok_L]
             When False, sequence is interleaved [fx_0, sep, tok_0, fx_1, sep, tok_1, ...].
     """
@@ -110,7 +111,7 @@ class CATConfig(PretrainedConfig):
         fuse_cross_entropy: bool = True,
         fuse_linear_cross_entropy: bool = False,
         vocab_size: int = 32000,
-        use_staircase_attention: bool = False,
+        use_staircase_attention: bool = True,
         **kwargs,
     ):
         # Decoder parameters
