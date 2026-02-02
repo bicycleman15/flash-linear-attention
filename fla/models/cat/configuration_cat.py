@@ -70,6 +70,10 @@ class CATConfig(PretrainedConfig):
             Whether to use fused linear cross entropy (memory efficient).
         vocab_size (`int`, *optional*, defaults to 32000):
             Vocabulary size.
+        use_staircase_attention (`bool`, *optional*, defaults to False):
+            Whether to use staircase attention pattern with globals-first sequence structure.
+            When True, sequence is [fx_0, ..., fx_K, tok_0, ..., tok_L]
+            When False, sequence is interleaved [fx_0, sep, tok_0, fx_1, sep, tok_1, ...].
     """
 
     model_type = 'cat'
@@ -106,6 +110,7 @@ class CATConfig(PretrainedConfig):
         fuse_cross_entropy: bool = True,
         fuse_linear_cross_entropy: bool = False,
         vocab_size: int = 32000,
+        use_staircase_attention: bool = False,
         **kwargs,
     ):
         # Decoder parameters
@@ -153,6 +158,9 @@ class CATConfig(PretrainedConfig):
         self.fuse_cross_entropy = fuse_cross_entropy
         self.fuse_linear_cross_entropy = fuse_linear_cross_entropy
         self.vocab_size = vocab_size
+        
+        # Staircase attention (globals-first sequence structure)
+        self.use_staircase_attention = use_staircase_attention
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(

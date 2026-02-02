@@ -73,6 +73,41 @@ def get_block_diagonal_mask_mod(block_size: int):
     return block_diagonal
 
 
+def get_staircase_mask_mod(chunk_size: int, num_globals: int):
+    """
+    Staircase attention mask.
+    
+    Sequence structure: [fx_0, ..., fx_K, sep_0, tok_0_0, ..., tok_0_{l-1}, ..., sep_K]
+    - First (K+1) positions: global fx slots (adaptive_tok + compressed representations)
+    - Remaining K*(1+l)+1 positions: local blocks [sep, tok_0, ..., tok_{l-1}] per chunk + final sep
+    
+    Attention pattern:
+    - Global staircase: query in block q can attend to fx slots 0..q
+    - Within block: causal attention to tokens in same chunk (including sep)
+    
+    Args:
+        chunk_size: Size of each chunk (l), not including separator
+        num_globals: Number of global slots (K+1 = num_chunks + 1)
+    """
+    local_block_size = 1 + chunk_size  # sep + chunk_size tokens
+    
+    def staircase_mask(b, h, q_idx, kv_idx):
+        q_blk = q_idx // local_block_size
+        
+        # Global slots (0..num_globals-1), staircase-gated by query block id
+        global_stair = (kv_idx < num_globals) & (q_blk >= kv_idx)
+        
+        # Local blocks live at kv_idx >= num_globals
+        kv_tok = kv_idx - num_globals
+        within_block = (kv_idx >= num_globals) & (q_blk == (kv_tok // local_block_size))
+        
+        # Causality: globals always OK; locals causal w.r.t. token index
+        causal = (kv_idx < num_globals) | (q_idx >= kv_tok)
+        
+        return (global_stair | within_block) & causal
+    return staircase_mask
+
+
 class CATCompressorBlock(GradientCheckpointingLayer):
     """Transformer block for the CAT compressor."""
 
@@ -525,6 +560,46 @@ class CATModel(CATPreTrainedModel):
         
         return cos, sin
 
+    def _build_staircase_rope_cache(
+        self,
+        num_globals: int,
+        num_chunks: int,
+        chunk_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build RoPE for staircase structure.
+        
+        Sequence: [fx_0, ..., fx_K, sep_0, tok_0_0, ..., tok_0_{l-1}, ..., sep_K]
+        - Global fx tokens: position 0 for all (compressed representations)
+        - Local blocks: positions repeat per chunk (0, 1, ..., l) where 0=sep, 1..l=tokens
+        - Final sep: position 0
+        """
+        local_block_size = 1 + chunk_size  # sep + chunk_size tokens
+        
+        # Cache for max possible position
+        max_pos = 1 + local_block_size
+        self.rotary._update_cos_sin_cache(max_pos, device=device, dtype=dtype)
+        cos_base = self.rotary._cos_cached
+        sin_base = self.rotary._sin_cached
+        
+        # Global positions: all 0s (fx tokens represent compressed info, not sequential)
+        global_positions = torch.zeros(num_globals, device=device, dtype=torch.long)
+        
+        # Local positions: repeat (0, 1, ..., l) for each chunk (0=sep, 1..l=tokens)
+        local_positions = torch.arange(local_block_size, device=device).repeat(num_chunks)
+        
+        # Final separator position: 0
+        final_sep_position = torch.zeros(1, device=device, dtype=torch.long)
+        
+        positions = torch.cat([global_positions, local_positions, final_sep_position])
+        
+        cos = cos_base[positions]
+        sin = sin_base[positions]
+        
+        return cos, sin
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -611,47 +686,79 @@ class CATModel(CATPreTrainedModel):
         else:
             raise NotImplementedError("inputs_embeds not yet supported for CAT")
         
-        # Build decoder input sequence for parallel processing
-        # Structure: [adaptive_token, sep, tokens_0, fx_0, sep, tokens_1, ..., fx_{n-1}, sep]
-        
-        # Adaptive token
+        # Build decoder input sequence based on attention pattern
         chunk_size_idx = torch.tensor([chunk_size], device=device, dtype=torch.long)
         adaptive_tok = self.adaptive_token(chunk_size_idx)  # [1, hidden]
         adaptive_tok = repeat(adaptive_tok, '1 d -> b 1 d', b=batch_size)
         
-        # Separator tokens
-        sep_idx = torch.zeros(1, device=device, dtype=torch.long)
-        sep_token = self.separator(sep_idx)  # [1, hidden]
-        sep_token = repeat(sep_token, '1 d -> b k 1 d', b=batch_size, k=num_chunks)
-        
-        # Combine: [fx, sep, tokens] for each chunk
-        # For first chunk, use adaptive_token; for others, use fx from previous chunk
-        # adaptive_tok: [b, 1, d] -> unsqueeze(1) -> [b, 1, 1, d]
-        # fx[:, :-1, :]: [b, k-1, d] -> unsqueeze(2) -> [b, k-1, 1, d]
-        fx_shifted = torch.cat([adaptive_tok.unsqueeze(1), fx[:, :-1, :].unsqueeze(2)], dim=1)  # [batch, num_chunks, 1, hidden]
-        
-        # Build sequence: [fx, sep, tokens] per chunk
-        decoder_input = torch.cat([fx_shifted, sep_token, token_embeds], dim=2)  # [batch, num_chunks, 2+chunk_size, hidden]
-        decoder_input = rearrange(decoder_input, 'b k l d -> b (k l) d')  # [batch, num_chunks*(2+chunk_size), hidden]
-        
-        # Add final fx and separator for last token's prediction
-        last_sep = repeat(self.separator(sep_idx), '1 d -> b 1 d', b=batch_size)
-        decoder_input = torch.cat([decoder_input, fx_last, last_sep], dim=1)
-        
-        hidden_states = decoder_input
-        total_seq_len = hidden_states.shape[1]
-        
-        # Build RoPE cache for CAT positions
-        cos, sin = self._build_cat_rope_cache(num_chunks, chunk_size, device, hidden_states.dtype)
-        
-        # Build CAT attention mask
-        block_size = 2 + chunk_size
-        block_mask = create_block_mask(
-            get_cat_mask_mod(block_size),
-            B=None, H=None,
-            Q_LEN=total_seq_len,
-            KV_LEN=total_seq_len,
-        )
+        if self.config.use_staircase_attention:
+            # STAIRCASE: Sequence structure [fx_0, ..., fx_K, sep_0, tok_0_0, ..., sep_K]
+            # Globals: adaptive_tok + all fx tokens (K+1 total)
+            # This allows final sep to see fx_last via staircase
+            num_globals = num_chunks + 1
+            fx_globals = torch.cat([adaptive_tok, fx], dim=1)  # [batch, K+1, hidden]
+            
+            # Separator tokens for each chunk + final separator
+            sep_idx = torch.zeros(1, device=device, dtype=torch.long)
+            sep_token = self.separator(sep_idx)  # [1, hidden]
+            sep_tokens = repeat(sep_token, '1 d -> b k 1 d', b=batch_size, k=num_chunks)
+            
+            # Build local blocks: [sep, tok_0, ..., tok_{l-1}] per chunk
+            local_blocks = torch.cat([sep_tokens, token_embeds], dim=2)  # [batch, K, 1+l, hidden]
+            local_blocks_flat = rearrange(local_blocks, 'b k l d -> b (k l) d')  # [batch, K*(1+l), hidden]
+            
+            # Final separator for last token's prediction
+            last_sep = repeat(sep_token, '1 d -> b 1 d', b=batch_size)
+            
+            # Concatenate: globals first, then locals, then final sep
+            decoder_input = torch.cat([fx_globals, local_blocks_flat, last_sep], dim=1)  # [batch, (K+1) + K*(1+l) + 1, hidden]
+            
+            hidden_states = decoder_input
+            total_seq_len = hidden_states.shape[1]
+            
+            # Build staircase RoPE cache
+            cos, sin = self._build_staircase_rope_cache(num_globals, num_chunks, chunk_size, device, hidden_states.dtype)
+            
+            # Build staircase attention mask
+            block_mask = create_block_mask(
+                get_staircase_mask_mod(chunk_size, num_globals),
+                B=None, H=None,
+                Q_LEN=total_seq_len,
+                KV_LEN=total_seq_len,
+            )
+        else:
+            # INTERLEAVED: Structure [fx, sep, tokens] per chunk
+            # Separator tokens
+            sep_idx = torch.zeros(1, device=device, dtype=torch.long)
+            sep_token = self.separator(sep_idx)  # [1, hidden]
+            sep_token = repeat(sep_token, '1 d -> b k 1 d', b=batch_size, k=num_chunks)
+            
+            # Combine: [fx, sep, tokens] for each chunk
+            # For first chunk, use adaptive_token; for others, use fx from previous chunk
+            fx_shifted = torch.cat([adaptive_tok.unsqueeze(1), fx[:, :-1, :].unsqueeze(2)], dim=1)  # [batch, num_chunks, 1, hidden]
+            
+            # Build sequence: [fx, sep, tokens] per chunk
+            decoder_input = torch.cat([fx_shifted, sep_token, token_embeds], dim=2)  # [batch, num_chunks, 2+chunk_size, hidden]
+            decoder_input = rearrange(decoder_input, 'b k l d -> b (k l) d')  # [batch, num_chunks*(2+chunk_size), hidden]
+            
+            # Add final fx and separator for last token's prediction
+            last_sep = repeat(self.separator(sep_idx), '1 d -> b 1 d', b=batch_size)
+            decoder_input = torch.cat([decoder_input, fx_last, last_sep], dim=1)
+            
+            hidden_states = decoder_input
+            total_seq_len = hidden_states.shape[1]
+            
+            # Build RoPE cache for CAT positions
+            cos, sin = self._build_cat_rope_cache(num_chunks, chunk_size, device, hidden_states.dtype)
+            
+            # Build CAT attention mask
+            block_size = 2 + chunk_size
+            block_mask = create_block_mask(
+                get_cat_mask_mod(block_size),
+                B=None, H=None,
+                Q_LEN=total_seq_len,
+                KV_LEN=total_seq_len,
+            )
         
         all_hidden_states = () if output_hidden_states else None
         
@@ -672,45 +779,73 @@ class CATModel(CATPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
         
-        # Rearrange output back to [batch, seq_len, hidden]
-        # Extract the last token position from each chunk for next-token prediction
-        block_size = 2 + chunk_size
-        
-        # Get the prediction for the last token (from final separator position)
-        last_pred = hidden_states[:, -1:, :]  # [batch, 1, hidden]
-        
-        # Get predictions from within chunks
-        # The structure is: [fx, sep, tok_0, tok_1, ..., tok_{l-1}] per chunk
-        # We want predictions at positions: sep (predicts tok_0), tok_0 (predicts tok_1), ..., tok_{l-2} (predicts tok_{l-1})
-        # And from the last fx+sep we get prediction for first token of next chunk
-        
-        hidden_states_chunks = rearrange(
-            hidden_states[:, :-2, :],  # Remove final fx and sep
-            'b (k l) d -> b k l d',
-            k=num_chunks,
-            l=block_size,
-        )
-        
-        # For first chunk: need predictions from positions [fx, sep, tok_0, ..., tok_{l-2}] (predict tok_0 to tok_{l-1})
-        # Actually we need: position sep predicts tok_0, tok_0 predicts tok_1, ..., tok_{l-2} predicts tok_{l-1}
-        # So we take positions 1 (sep) through l-1 (tok_{l-2}) = positions [1, l-1]
-        
-        # For simplicity, let's restructure:
-        # Each chunk contributes predictions for its tokens
-        # Position fx_{i} (at start of chunk i+1) predicts tok_0 of chunk i+1
-        # Position sep predicts tok_0, tok_0 predicts tok_1, etc.
-        
-        # Take positions [1, 2, ..., l] from each chunk (sep through last token)
-        # But the last token's prediction is for the next chunk's first token
-        first_chunk_preds = hidden_states_chunks[:, 0, 1:-1, :]  # [batch, chunk_size-1, hidden]
-        middle_chunk_preds = hidden_states_chunks[:, 1:, :-1, :]  # [batch, num_chunks-1, chunk_size+1, hidden]
-        middle_chunk_preds = rearrange(middle_chunk_preds, 'b k l d -> b (k l) d')
-        
-        # Combine predictions
-        output_hidden = torch.cat([first_chunk_preds, middle_chunk_preds, last_pred], dim=1)
-        
-        # Trim to original sequence length
-        output_hidden = output_hidden[:, :original_seq_len, :]
+        if self.config.use_staircase_attention:
+            # STAIRCASE output extraction
+            # Structure: [fx_0, ..., fx_K, sep_0, tok_0_0, ..., tok_0_{l-1}, ..., sep_K]
+            # Skip fx tokens (num_globals), get local part + final sep
+            num_globals = num_chunks + 1
+            local_block_size = 1 + chunk_size  # sep + chunk_size tokens
+            
+            # Get last sep prediction
+            last_pred = hidden_states[:, -1:, :]  # [batch, 1, hidden]
+            
+            # Get local blocks (excluding final sep)
+            local_hidden = hidden_states[:, num_globals:-1, :]  # [batch, K*(1+l), hidden]
+            
+            # Reshape to [batch, K, 1+l, hidden]
+            local_hidden = rearrange(local_hidden, 'b (k l) d -> b k l d', k=num_chunks, l=local_block_size)
+            
+            # Extract predictions: sep predicts tok_0, tok_0 predicts tok_1, ..., tok_{l-1} predicts next
+            # Take positions 0 through l-1 (sep through tok_{l-2}), which predict tok_0 through tok_{l-1}
+            chunk_preds = local_hidden[:, :, :-1, :]  # [batch, K, l, hidden] - drop last position of each block
+            chunk_preds = rearrange(chunk_preds, 'b k l d -> b (k l) d')  # [batch, K*l, hidden]
+            
+            # Combine chunk predictions with last sep prediction
+            output_hidden = torch.cat([chunk_preds, last_pred], dim=1)
+            
+            # Trim to original sequence length
+            output_hidden = output_hidden[:, :original_seq_len, :]
+        else:
+            # INTERLEAVED output extraction
+            # Rearrange output back to [batch, seq_len, hidden]
+            # Extract the last token position from each chunk for next-token prediction
+            block_size = 2 + chunk_size
+            
+            # Get the prediction for the last token (from final separator position)
+            last_pred = hidden_states[:, -1:, :]  # [batch, 1, hidden]
+            
+            # Get predictions from within chunks
+            # The structure is: [fx, sep, tok_0, tok_1, ..., tok_{l-1}] per chunk
+            # We want predictions at positions: sep (predicts tok_0), tok_0 (predicts tok_1), ..., tok_{l-2} (predicts tok_{l-1})
+            # And from the last fx+sep we get prediction for first token of next chunk
+            
+            hidden_states_chunks = rearrange(
+                hidden_states[:, :-2, :],  # Remove final fx and sep
+                'b (k l) d -> b k l d',
+                k=num_chunks,
+                l=block_size,
+            )
+            
+            # For first chunk: need predictions from positions [fx, sep, tok_0, ..., tok_{l-2}] (predict tok_0 to tok_{l-1})
+            # Actually we need: position sep predicts tok_0, tok_0 predicts tok_1, ..., tok_{l-2} predicts tok_{l-1}
+            # So we take positions 1 (sep) through l-1 (tok_{l-2}) = positions [1, l-1]
+            
+            # For simplicity, let's restructure:
+            # Each chunk contributes predictions for its tokens
+            # Position fx_{i} (at start of chunk i+1) predicts tok_0 of chunk i+1
+            # Position sep predicts tok_0, tok_0 predicts tok_1, etc.
+            
+            # Take positions [1, 2, ..., l] from each chunk (sep through last token)
+            # But the last token's prediction is for the next chunk's first token
+            first_chunk_preds = hidden_states_chunks[:, 0, 1:-1, :]  # [batch, chunk_size-1, hidden]
+            middle_chunk_preds = hidden_states_chunks[:, 1:, :-1, :]  # [batch, num_chunks-1, chunk_size+1, hidden]
+            middle_chunk_preds = rearrange(middle_chunk_preds, 'b k l d -> b (k l) d')
+            
+            # Combine predictions
+            output_hidden = torch.cat([first_chunk_preds, middle_chunk_preds, last_pred], dim=1)
+            
+            # Trim to original sequence length
+            output_hidden = output_hidden[:, :original_seq_len, :]
         
         if not return_dict:
             return tuple(v for v in [output_hidden, None, all_hidden_states, None] if v is not None)
